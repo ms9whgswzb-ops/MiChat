@@ -4,24 +4,30 @@ from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 from db import Base
 
+
 class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(50), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
-    color = Column(String(7), default="#ffffff")  # z.B. #ff0000
+    color = Column(String(7), default="#ffffff")
     is_admin = Column(Boolean, default=False)
 
-    messages = relationship("Message", back_populates="user")
+    messages = relationship("Message", back_populates="user", foreign_keys="Message.user_id")
+    private_messages_received = relationship(
+        "Message", foreign_keys="Message.recipient_id", viewonly=True
+    )
 
 
 class Message(Base):
     __tablename__ = "messages"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)  # Sender
+    recipient_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # None = global
     content = Column(String(1000), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-    user = relationship("User", back_populates="messages")
+    user = relationship("User", foreign_keys=[user_id], back_populates="messages")
+    recipient = relationship("User", foreign_keys=[recipient_id])
