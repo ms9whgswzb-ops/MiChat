@@ -116,6 +116,33 @@ button:active {
     box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
 }
 
+.chat-top-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.chat-target-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+}
+
+.chat-target-group select {
+    background: #020617;
+    border: 1px solid #1f2937;
+    border-radius: 8px;
+    padding: 4px 8px;
+    color: #e5e7eb;
+}
+
+.chat-subtitle {
+    font-size: 13px;
+    color: #9ca3af;
+}
+
 .messages {
     flex: 1;
     overflow-y: auto;
