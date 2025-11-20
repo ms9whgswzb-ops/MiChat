@@ -1,6 +1,6 @@
 # schemas.py
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class UserCreate(BaseModel):
@@ -15,8 +15,8 @@ class UserOut(BaseModel):
     color: str
     is_admin: bool
 
-    class Config:
-        orm_mode = True
+    # Pydantic v2: statt class Config: orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class Token(BaseModel):
@@ -41,5 +41,4 @@ class MessageOut(BaseModel):
     content: str
     created_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
