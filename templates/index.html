@@ -1,0 +1,51 @@
+<!-- templates/index.html -->
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8" />
+    <title>MiChat</title>
+    <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+    <div class="app-container">
+        <div class="auth-container">
+            <h1>MiChat</h1>
+
+            <div id="auth-forms">
+                <div class="card">
+                    <h2>Registrieren</h2>
+                    <input id="reg-username" type="text" placeholder="Benutzername" />
+                    <input id="reg-password" type="password" placeholder="Passwort" />
+                    <input id="reg-color" type="color" value="#ffffff" />
+                    <button id="register-btn">Registrieren</button>
+                    <p class="error" id="register-error"></p>
+                </div>
+
+                <div class="card">
+                    <h2>Login</h2>
+                    <input id="login-username" type="text" placeholder="Benutzername" />
+                    <input id="login-password" type="password" placeholder="Passwort" />
+                    <button id="login-btn">Login</button>
+                    <p class="error" id="login-error"></p>
+                </div>
+            </div>
+
+            <div id="user-info" class="card hidden">
+                <p>Eingeloggt als: <span id="current-username"></span></p>
+                <button id="logout-btn">Logout</button>
+            </div>
+        </div>
+
+        <div class="chat-container">
+            <div id="messages" class="messages"></div>
+
+            <div class="message-input">
+                <input id="message-text" type="text" placeholder="Nachricht eingeben..." />
+                <button id="send-btn">Senden</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/chat.js"></script>
+</body>
+</html>
