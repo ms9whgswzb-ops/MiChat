@@ -4,8 +4,7 @@ const API_BASE = "";
 
 let accessToken = null;
 let currentUser = null;
-let lastMessageId = null;
-let pollIntervalId = null;
+let socket = null;
 
 // DOM Elemente
 const regUsername = document.getElementById("reg-username");
@@ -29,6 +28,9 @@ const authForms = document.getElementById("auth-forms");
 const userInfoCard = document.getElementById("user-info");
 const currentUsernameSpan = document.getElementById("current-username");
 
+const chatTargetSelect = document.getElementById("chat-target");
+const chatSubtitle = document.getElementById("chat-subtitle");
+
 // ---------- Helper ----------
 
 function setLoggedIn(user, token) {
@@ -39,13 +41,16 @@ function setLoggedIn(user, token) {
     userInfoCard.classList.remove("hidden");
     currentUsernameSpan.textContent = user.username;
 
-    startPolling();
+    messagesDiv.innerHTML = "";
+
+    connectWebSocket();
+    loadUsersList();
+    loadMessagesForCurrentTarget();
 }
 
 function setLoggedOut() {
     currentUser = null;
     accessToken = null;
-    lastMessageId = null;
 
     authForms.classList.remove("hidden");
     userInfoCard.classList.add("hidden");
@@ -53,20 +58,30 @@ function setLoggedOut() {
 
     messagesDiv.innerHTML = "";
 
-    if (pollIntervalId) {
-        clearInterval(pollIntervalId);
-        pollIntervalId = null;
+    if (socket) {
+        try {
+            socket.close();
+        } catch {}
+        socket = null;
     }
+
+    // Reset Chat-Auswahl
+    chatTargetSelect.innerHTML = `<option value="global">🌍 Globaler Chat</option>`;
+    chatSubtitle.textContent = "Öffentlicher Raum";
 }
 
-function startPolling() {
-    if (pollIntervalId) {
-        clearInterval(pollIntervalId);
+function getCurrentChatTarget() {
+    const value = chatTargetSelect.value;
+    if (value === "global") {
+        return { mode: "global" };
+    } else {
+        const userId = parseInt(value, 10);
+        if (!isNaN(userId)) {
+            return { mode: "private", userId };
+        } else {
+            return { mode: "global" };
+        }
     }
-    // Initial: komplette History (bis max. 50) laden
-    loadMessages(true);
-    // Danach nur neue Nachrichten nachladen
-    pollIntervalId = setInterval(() => loadMessages(false), 3000);
 }
 
 async function apiRequest(path, method = "GET", body = null, authenticated = false) {
@@ -77,8 +92,8 @@ async function apiRequest(path, method = "GET", body = null, authenticated = fal
     let url = API_BASE + path;
 
     if (authenticated && accessToken) {
-        const separator = url.includes("?") ? "&" : "?";
-        url = `${url}${separator}token=${encodeURIComponent("Bearer " + accessToken)}`;
+        const sep = url.includes("?") ? "&" : "?";
+        url = `${url}${sep}token=${encodeURIComponent("Bearer " + accessToken)}`;
     }
 
     const opts = { method, headers };
@@ -97,6 +112,80 @@ async function apiRequest(path, method = "GET", body = null, authenticated = fal
     }
     if (res.status === 204) return null;
     return res.json();
+}
+
+// ---------- WebSocket ----------
+
+function connectWebSocket() {
+    if (!accessToken) return;
+
+    if (socket) {
+        try {
+            socket.close();
+        } catch {}
+    }
+
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+    const wsUrl =
+        protocol +
+        "://" +
+        window.location.host +
+        `/ws?token=${encodeURIComponent(accessToken)}`;
+
+    socket = new WebSocket(wsUrl);
+
+    socket.onopen = () => {
+        console.log("WebSocket verbunden");
+    };
+
+    socket.onclose = () => {
+        console.log("WebSocket getrennt");
+        // optional: Reconnect-Logik einbauen
+    };
+
+    socket.onerror = (err) => {
+        console.error("WebSocket Fehler:", err);
+    };
+
+    socket.onmessage = (event) => {
+        try {
+            const msg = JSON.parse(event.data);
+            handleIncomingMessage(msg);
+        } catch (e) {
+            console.error("Fehler beim Parsen der WS-Nachricht:", e);
+        }
+    };
+}
+
+function handleIncomingMessage(msg) {
+    if (!currentUser) return;
+
+    const isPrivate = msg.recipient_id !== null && msg.recipient_id !== undefined;
+
+    if (!isPrivate) {
+        // Globaler Chat
+        const target = getCurrentChatTarget();
+        if (target.mode === "global") {
+            appendMessage(msg);
+            scrollMessagesToBottom();
+        }
+    } else {
+        // Private Nachricht
+        const involved =
+            msg.user_id === currentUser.id || msg.recipient_id === currentUser.id;
+        if (!involved) return;
+
+        const partnerId =
+            msg.user_id === currentUser.id ? msg.recipient_id : msg.user_id;
+
+        const target = getCurrentChatTarget();
+        if (target.mode === "private" && target.userId === partnerId) {
+            appendMessage(msg);
+            scrollMessagesToBottom();
+        } else {
+            // Optional: später Badge/Notification im User-Dropdown machen
+        }
+    }
 }
 
 // ---------- Auth Actions ----------
@@ -154,9 +243,63 @@ logoutBtn.addEventListener("click", () => {
     setLoggedOut();
 });
 
-// ---------- Chat ----------
+// ---------- User-Liste / Chat-Ziel ----------
 
-sendBtn.addEventListener("click", async () => {
+async function loadUsersList() {
+    if (!accessToken) return;
+
+    try {
+        const users = await apiRequest(
+            `/users?token=${encodeURIComponent("Bearer " + accessToken)}`,
+            "GET",
+            null,
+            false
+        );
+
+        // Select leeren & Global hinzufügen
+        chatTargetSelect.innerHTML = `<option value="global">🌍 Globaler Chat</option>`;
+
+        if (!Array.isArray(users)) return;
+
+        users.forEach((user) => {
+            if (user.id === currentUser.id) return; // sich selbst nicht anzeigen
+            const opt = document.createElement("option");
+            opt.value = String(user.id);
+            opt.textContent = user.username;
+            chatTargetSelect.appendChild(opt);
+        });
+    } catch (err) {
+        console.error("Fehler beim Laden der User-Liste:", err);
+    }
+}
+
+chatTargetSelect.addEventListener("change", () => {
+    const target = getCurrentChatTarget();
+    if (target.mode === "global") {
+        chatSubtitle.textContent = "Öffentlicher Raum";
+    } else {
+        const selectedOption =
+            chatTargetSelect.options[chatTargetSelect.selectedIndex];
+        chatSubtitle.textContent = `Privatchat mit ${selectedOption.textContent}`;
+    }
+
+    // Chat-Verlauf für das neue Ziel laden
+    loadMessagesForCurrentTarget();
+});
+
+// ---------- Nachrichten (HTTP für History, WS für neue Nachrichten) ----------
+
+sendBtn.addEventListener("click", () => {
+    sendCurrentMessage();
+});
+
+messageInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+        sendCurrentMessage();
+    }
+});
+
+function sendCurrentMessage() {
     if (!currentUser || !accessToken) {
         alert("Bitte zuerst einloggen.");
         return;
@@ -165,44 +308,61 @@ sendBtn.addEventListener("click", async () => {
     const text = messageInput.value.trim();
     if (!text) return;
 
-    try {
-        // Nachricht senden
-        await apiRequest("/messages", "POST", { content: text }, true);
-        messageInput.value = "";
-        // Nur NEUE Nachrichten nachladen (kein komplettes Reset)
-        await loadMessages(false);
-    } catch (err) {
-        alert("Fehler beim Senden: " + err.message);
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+        alert("Verbindung zum Chat-Server nicht aktiv.");
+        return;
     }
-});
 
-messageInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-        sendBtn.click();
+    const target = getCurrentChatTarget();
+
+    if (target.mode === "global") {
+        socket.send(
+            JSON.stringify({
+                type: "public_message",
+                content: text,
+            })
+        );
+    } else {
+        socket.send(
+            JSON.stringify({
+                type: "private_message",
+                content: text,
+                recipient_id: target.userId,
+            })
+        );
     }
-});
 
-async function loadMessages(initial = false) {
-    try {
-        let path = "/messages?limit=50";
+    messageInput.value = "";
+}
 
-        if (initial) {
-            // Bei initialem Laden Chat leeren und von vorne aufbauen
-            messagesDiv.innerHTML = "";
-            lastMessageId = null;
-        } else if (lastMessageId !== null) {
-            // Nur Nachrichten nach der letzten ID laden
-            path += `&after_id=${lastMessageId}`;
+async function loadMessagesForCurrentTarget() {
+    if (!currentUser) return;
+
+    messagesDiv.innerHTML = "";
+
+    const target = getCurrentChatTarget();
+
+    try:
+        let path;
+        let authenticated = false;
+
+        if (target.mode === "global") {
+            path = "/messages?limit=50";
+        } else {
+            path = `/private/messages?with_user_id=${target.userId}&limit=100`;
+            authenticated = true;
         }
 
-        const newMessages = await apiRequest(path, "GET", null, false);
+        const msgs = await apiRequest(
+            path,
+            "GET",
+            null,
+            authenticated
+        );
 
-        if (Array.isArray(newMessages) && newMessages.length > 0) {
-            for (const msg of newMessages) {
-                appendMessage(msg);
-                lastMessageId = msg.id;
-            }
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        if (Array.isArray(msgs)) {
+            msgs.forEach((m) => appendMessage(m));
+            scrollMessagesToBottom();
         }
     } catch (err) {
         console.error("Fehler beim Laden der Nachrichten:", err);
@@ -229,4 +389,8 @@ function appendMessage(msg) {
     msgDiv.appendChild(textSpan);
 
     messagesDiv.appendChild(msgDiv);
+}
+
+function scrollMessagesToBottom() {
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
 }
