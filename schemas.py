@@ -15,7 +15,6 @@ class UserOut(BaseModel):
     color: str
     is_admin: bool
 
-    # Pydantic v2: statt class Config: orm_mode = True
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -33,11 +32,18 @@ class MessageCreate(BaseModel):
     content: str
 
 
+class PrivateMessageCreate(BaseModel):
+    recipient_id: int
+    content: str
+
+
 class MessageOut(BaseModel):
     id: int
+    user_id: int
     username: str
     color: str
     is_admin: bool
+    recipient_id: int | None = None
     content: str
     created_at: datetime
 
