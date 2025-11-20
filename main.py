@@ -1,6 +1,6 @@
 # main.py
 import os
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from fastapi import (
     Depends,
@@ -8,13 +8,16 @@ from fastapi import (
     HTTPException,
     Request,
     status,
+    WebSocket,
+    WebSocketDisconnect,
+    Query,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
-
+from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
+from sqlalchemy import or_, and_
 
 from dotenv import load_dotenv
 
@@ -26,6 +29,7 @@ from schemas import (
     Token,
     LoginRequest,
     MessageCreate,
+    PrivateMessageCreate,
     MessageOut,
 )
 from auth import (
@@ -55,7 +59,7 @@ app = FastAPI(title="MiChat")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # für Produktion: auf deine Domain einschränken
+    allow_origins=["*"],  # für Produktion einschränken
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -120,13 +124,54 @@ def on_startup():
         db.close()
 
 
-# ---------- Routes ----------
+# ---------- WebSocket Connection Manager ----------
+class ConnectionManager:
+    def __init__(self):
+        # user_id -> Liste von WebSocket-Verbindungen
+        self.active_connections: Dict[int, List[WebSocket]] = {}
 
+    async def connect(self, websocket: WebSocket, user_id: int):
+        await websocket.accept()
+        self.active_connections.setdefault(user_id, []).append(websocket)
+
+    def disconnect(self, websocket: WebSocket, user_id: int):
+        conns = self.active_connections.get(user_id)
+        if not conns:
+            return
+        if websocket in conns:
+            conns.remove(websocket)
+        if not conns:
+            del self.active_connections[user_id]
+
+    async def send_personal(self, user_id: int, message: dict):
+        conns = self.active_connections.get(user_id, [])
+        to_remove = []
+        for ws in conns:
+            try:
+                await ws.send_json(message)
+            except WebSocketDisconnect:
+                to_remove.append(ws)
+            except Exception:
+                to_remove.append(ws)
+        for ws in to_remove:
+            self.disconnect(ws, user_id)
+
+    async def broadcast(self, message: dict):
+        # An alle verbundenen User senden
+        for uid in list(self.active_connections.keys()):
+            await self.send_personal(uid, message)
+
+
+manager = ConnectionManager()
+
+
+# ---------- Routes (HTML) ----------
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 
+# ---------- Auth- & User-Routen ----------
 @app.post("/register", response_model=UserOut)
 def register(user_in: UserCreate, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.username == user_in.username).first()
@@ -167,59 +212,181 @@ def me(token: str, db: Session = Depends(get_db)):
     return user
 
 
-@app.post("/messages", response_model=MessageOut)
-def send_message(
-    msg_in: MessageCreate,
-    token: str,
-    db: Session = Depends(get_db),
-):
-    user = get_current_user(token, db)
-
-    if not msg_in.content.strip():
-        raise HTTPException(status_code=400, detail="Nachricht darf nicht leer sein")
-
-    message = Message(
-        user_id=user.id,
-        content=msg_in.content.strip(),
-    )
-    db.add(message)
-    db.commit()
-    db.refresh(message)
-
-    return MessageOut(
-        id=message.id,
-        username=user.username,
-        color=user.color,
-        is_admin=user.is_admin,
-        content=message.content,
-        created_at=message.created_at,
-    )
+@app.get("/users", response_model=List[UserOut])
+def list_users(token: str, db: Session = Depends(get_db)):
+    current_user = get_current_user(token, db)
+    users = db.query(User).order_by(User.username.asc()).all()
+    return users
 
 
+# ---------- HTTP: Nachrichten laden (History) ----------
 @app.get("/messages", response_model=List[MessageOut])
-def get_messages(
+def get_public_messages(
     limit: int = 50,
-    after_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
-    query = db.query(Message).join(User).order_by(Message.id.desc())
-
-    if after_id is not None:
-        query = query.filter(Message.id > after_id)
+    query = (
+        db.query(Message)
+        .join(User, Message.user_id == User.id)
+        .filter(Message.recipient_id.is_(None))
+        .order_by(Message.id.desc())
+    )
 
     messages = query.limit(limit).all()
-    messages = list(reversed(messages))  # chronologisch aufsteigend
+    messages = list(reversed(messages))
 
     result: List[MessageOut] = []
     for m in messages:
         result.append(
             MessageOut(
                 id=m.id,
+                user_id=m.user_id,
                 username=m.user.username,
                 color=m.user.color,
                 is_admin=m.user.is_admin,
+                recipient_id=m.recipient_id,
                 content=m.content,
                 created_at=m.created_at,
             )
         )
     return result
+
+
+@app.get("/private/messages", response_model=List[MessageOut])
+def get_private_messages(
+    with_user_id: int,
+    token: str,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    current_user = get_current_user(token, db)
+
+    query = (
+        db.query(Message)
+        .join(User, Message.user_id == User.id)
+        .filter(
+            Message.recipient_id.isnot(None),
+            or_(
+                and_(Message.user_id == current_user.id, Message.recipient_id == with_user_id),
+                and_(Message.user_id == with_user_id, Message.recipient_id == current_user.id),
+            ),
+        )
+        .order_by(Message.id.desc())
+    )
+
+    messages = query.limit(limit).all()
+    messages = list(reversed(messages))
+
+    result: List[MessageOut] = []
+    for m in messages:
+        result.append(
+            MessageOut(
+                id=m.id,
+                user_id=m.user_id,
+                username=m.user.username,
+                color=m.user.color,
+                is_admin=m.user.is_admin,
+                recipient_id=m.recipient_id,
+                content=m.content,
+                created_at=m.created_at,
+            )
+        )
+    return result
+
+
+# ---------- WebSocket: Chat in Echtzeit ----------
+@app.websocket("/ws")
+async def websocket_chat(websocket: WebSocket, token: str = Query(...)):
+    # Token ohne "Bearer " erwarten
+    try:
+        payload = decode_access_token(token)
+        user_id = int(payload.get("sub"))
+    except Exception:
+        await websocket.close(code=1008)
+        return
+
+    db = SessionLocal()
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        await websocket.close(code=1008)
+        db.close()
+        return
+
+    await manager.connect(websocket, user_id)
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
+            content = (data.get("content") or "").strip()
+
+            if not content:
+                continue
+
+            if msg_type == "public_message":
+                # globale Nachricht
+                message = Message(user_id=user.id, recipient_id=None, content=content)
+                db.add(message)
+                db.commit()
+                db.refresh(message)
+
+                payload = {
+                    "id": message.id,
+                    "user_id": user.id,
+                    "username": user.username,
+                    "color": user.color,
+                    "is_admin": user.is_admin,
+                    "recipient_id": None,
+                    "content": message.content,
+                    "created_at": message.created_at.isoformat(),
+                }
+                await manager.broadcast(payload)
+
+            elif msg_type == "private_message":
+                recipient_id = data.get("recipient_id")
+                if not isinstance(recipient_id, int):
+                    continue
+
+                recipient = db.query(User).filter(User.id == recipient_id).first()
+                if not recipient:
+                    continue
+
+                if recipient.id == user.id:
+                    # optional: sich selbst schreiben -> erlauben oder nicht
+                    pass
+
+                message = Message(
+                    user_id=user.id,
+                    recipient_id=recipient.id,
+                    content=content,
+                )
+                db.add(message)
+                db.commit()
+                db.refresh(message)
+
+                payload = {
+                    "id": message.id,
+                    "user_id": user.id,
+                    "username": user.username,
+                    "color": user.color,
+                    "is_admin": user.is_admin,
+                    "recipient_id": recipient.id,
+                    "content": message.content,
+                    "created_at": message.created_at.isoformat(),
+                }
+
+                # an Sender & Empfänger senden (falls online)
+                await manager.send_personal(user.id, payload)
+                if recipient.id != user.id:
+                    await manager.send_personal(recipient.id, payload)
+
+            else:
+                # unbekannter Typ, ignorieren
+                continue
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, user_id)
+    except Exception:
+        manager.disconnect(websocket, user_id)
+    finally:
+        db.close()
