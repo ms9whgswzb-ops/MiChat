@@ -51,6 +51,8 @@ function setLoggedOut() {
     userInfoCard.classList.add("hidden");
     currentUsernameSpan.textContent = "";
 
+    messagesDiv.innerHTML = "";
+
     if (pollIntervalId) {
         clearInterval(pollIntervalId);
         pollIntervalId = null;
@@ -61,7 +63,9 @@ function startPolling() {
     if (pollIntervalId) {
         clearInterval(pollIntervalId);
     }
+    // Initial: komplette History (bis max. 50) laden
     loadMessages(true);
+    // Danach nur neue Nachrichten nachladen
     pollIntervalId = setInterval(() => loadMessages(false), 3000);
 }
 
@@ -73,7 +77,6 @@ async function apiRequest(path, method = "GET", body = null, authenticated = fal
     let url = API_BASE + path;
 
     if (authenticated && accessToken) {
-        // Token wird als Query-Parameter geschickt, wie in main.py erwartet
         const separator = url.includes("?") ? "&" : "?";
         url = `${url}${separator}token=${encodeURIComponent("Bearer " + accessToken)}`;
     }
@@ -101,7 +104,7 @@ async function apiRequest(path, method = "GET", body = null, authenticated = fal
 registerBtn.addEventListener("click", async () => {
     regError.textContent = "";
     try {
-        const user = await apiRequest(
+        await apiRequest(
             "/register",
             "POST",
             {
@@ -136,7 +139,10 @@ loginBtn.addEventListener("click", async () => {
 
         accessToken = tokenData.access_token;
 
-        const user = await apiRequest(`/me?token=${encodeURIComponent("Bearer " + accessToken)}`, "GET");
+        const user = await apiRequest(
+            `/me?token=${encodeURIComponent("Bearer " + accessToken)}`,
+            "GET"
+        );
 
         setLoggedIn(user, accessToken);
     } catch (err) {
@@ -160,9 +166,11 @@ sendBtn.addEventListener("click", async () => {
     if (!text) return;
 
     try {
+        // Nachricht senden
         await apiRequest("/messages", "POST", { content: text }, true);
         messageInput.value = "";
-        await loadMessages(true);
+        // Nur NEUE Nachrichten nachladen (kein komplettes Reset)
+        await loadMessages(false);
     } catch (err) {
         alert("Fehler beim Senden: " + err.message);
     }
@@ -174,10 +182,16 @@ messageInput.addEventListener("keydown", (e) => {
     }
 });
 
-async function loadMessages(initial) {
+async function loadMessages(initial = false) {
     try {
         let path = "/messages?limit=50";
-        if (!initial && lastMessageId !== null) {
+
+        if (initial) {
+            // Bei initialem Laden Chat leeren und von vorne aufbauen
+            messagesDiv.innerHTML = "";
+            lastMessageId = null;
+        } else if (lastMessageId !== null) {
+            // Nur Nachrichten nach der letzten ID laden
             path += `&after_id=${lastMessageId}`;
         }
 
@@ -189,9 +203,6 @@ async function loadMessages(initial) {
                 lastMessageId = msg.id;
             }
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
-        } else if (initial) {
-            messagesDiv.innerHTML = "";
-            lastMessageId = null;
         }
     } catch (err) {
         console.error("Fehler beim Laden der Nachrichten:", err);
@@ -219,6 +230,3 @@ function appendMessage(msg) {
 
     messagesDiv.appendChild(msgDiv);
 }
-
-// Beim Laden der Seite: nur Nachrichten laden, wenn wir das später wollen.
-// Hier starten wir das Polling erst nach Login.
