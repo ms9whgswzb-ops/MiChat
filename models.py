@@ -12,12 +12,12 @@ class User(Base):
     username = Column(String(50), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
     color = Column(String(7), default="#ffffff")
+
     is_admin = Column(Boolean, default=False)
+    is_banned = Column(Boolean, default=False)
+    muted_until = Column(DateTime, nullable=True)
 
     messages = relationship("Message", back_populates="user", foreign_keys="Message.user_id")
-    private_messages_received = relationship(
-        "Message", foreign_keys="Message.recipient_id", viewonly=True
-    )
 
 
 class Message(Base):
@@ -30,4 +30,3 @@ class Message(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", foreign_keys=[user_id], back_populates="messages")
-    recipient = relationship("User", foreign_keys=[recipient_id])
