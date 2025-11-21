@@ -181,4 +181,201 @@ def register(user_in: UserCreate, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(400, "Benutzername ist bereits vergeben")
 
-    if user_in.username.lower() == os.getenv("ADMIN_USERNAME",
+    if user_in.username.lower() == os.getenv("ADMIN_USERNAME", "admin").lower():
+        raise HTTPException(400, "Benutzername ist reserviert")
+
+    user = User(
+        username=user_in.username,
+        password_hash=hash_password(user_in.password),
+        color=user_in.color,
+        is_admin=False,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.post("/login", response_model=Token)
+def login(login_in: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == login_in.username).first()
+    if not user:
+        raise HTTPException(401, "Falscher Benutzername oder Passwort")
+
+    if not verify_password(login_in.password, user.password_hash):
+        raise HTTPException(401, "Falscher Benutzername oder Passwort")
+
+    access_token = create_access_token(user_to_token_data(user))
+    return Token(access_token=access_token, token_type="bearer")
+
+
+@app.get("/me", response_model=UserOut)
+def me(token: str, db: Session = Depends(get_db)):
+    return get_current_user(token, db)
+
+
+@app.get("/users", response_model=List[UserOut])
+def list_users(token: str, db: Session = Depends(get_db)):
+    current = get_current_user(token, db)
+    users = db.query(User).order_by(User.username.asc()).all()
+    return users
+
+
+# ---------- ADMIN DELETE USER ----------
+@app.delete("/users/{user_id}", status_code=204)
+def delete_user(user_id: int, token: str, db: Session = Depends(get_db)):
+    current = get_current_user(token, db)
+
+    if not current.is_admin:
+        raise HTTPException(403, "Nur Admins dürfen löschen")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "Benutzer nicht gefunden")
+
+    if user.id == current.id:
+        raise HTTPException(400, "Du kannst dich nicht selbst löschen")
+
+    db.delete(user)
+    db.commit()
+    return None
+
+
+# ---------- MESSAGES ----------
+@app.get("/messages", response_model=List[MessageOut])
+def public_messages(limit: int = 50, db: Session = Depends(get_db)):
+    msgs = (
+        db.query(Message)
+        .join(User)
+        .filter(Message.recipient_id.is_(None))
+        .order_by(Message.id.desc())
+        .limit(limit)
+        .all()
+    )
+    msgs = list(reversed(msgs))
+
+    return [
+        MessageOut(
+            id=m.id,
+            user_id=m.user_id,
+            username=m.user.username,
+            color=m.user.color,
+            is_admin=m.user.is_admin,
+            recipient_id=m.recipient_id,
+            content=m.content,
+            created_at=m.created_at,
+        )
+        for m in msgs
+    ]
+
+
+@app.get("/private/messages", response_model=List[MessageOut])
+def private_messages(
+    with_user_id: int,
+    token: str,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    me = get_current_user(token, db)
+
+    msgs = (
+        db.query(Message)
+        .join(User)
+        .filter(
+            or_(
+                and_(Message.user_id == me.id, Message.recipient_id == with_user_id),
+                and_(Message.user_id == with_user_id, Message.recipient_id == me.id),
+            )
+        )
+        .order_by(Message.id.desc())
+        .limit(limit)
+        .all()
+    )
+    msgs = list(reversed(msgs))
+
+    return [
+        MessageOut(
+            id=m.id,
+            user_id=m.user_id,
+            username=m.user.username,
+            color=m.user.color,
+            is_admin=m.user.is_admin,
+            recipient_id=m.recipient_id,
+            content=m.content,
+            created_at=m.created_at,
+        )
+        for m in msgs
+    ]
+
+
+# ---------- WEBSOCKET ----------
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket, token: str):
+    db = SessionLocal()
+    try:
+        user = get_current_user(token, db)
+        await manager.connect(ws, user.id)
+
+        while True:
+            data = await ws.receive_json()
+
+            msg_type = data.get("type")
+            content = data.get("content")
+
+            if not content:
+                continue
+
+            if msg_type == "public_message":
+                msg = Message(
+                    user_id=user.id,
+                    content=content,
+                    recipient_id=None,
+                )
+                db.add(msg)
+                db.commit()
+                db.refresh(msg)
+
+                out = {
+                    "id": msg.id,
+                    "user_id": user.id,
+                    "username": user.username,
+                    "color": user.color,
+                    "is_admin": user.is_admin,
+                    "recipient_id": None,
+                    "content": msg.content,
+                    "created_at": msg.created_at.isoformat(),
+                }
+                await manager.broadcast(out)
+
+            elif msg_type == "private_message":
+                rid = data.get("recipient_id")
+                if not rid:
+                    continue
+
+                msg = Message(
+                    user_id=user.id,
+                    content=content,
+                    recipient_id=rid,
+                )
+                db.add(msg)
+                db.commit()
+                db.refresh(msg)
+
+                out = {
+                    "id": msg.id,
+                    "user_id": user.id,
+                    "username": user.username,
+                    "color": user.color,
+                    "is_admin": user.is_admin,
+                    "recipient_id": rid,
+                    "content": msg.content,
+                    "created_at": msg.created_at.isoformat(),
+                }
+
+                await manager.send_user(rid, out)
+                await manager.send_user(user.id, out)
+
+    except WebSocketDisconnect:
+        manager.disconnect(ws, user.id)
+    finally:
+        db.close()
