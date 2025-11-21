@@ -14,6 +14,8 @@ class UserOut(BaseModel):
     username: str
     color: str
     is_admin: bool
+    is_banned: bool
+    muted_until: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -28,15 +30,6 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class MessageCreate(BaseModel):
-    content: str
-
-
-class PrivateMessageCreate(BaseModel):
-    recipient_id: int
-    content: str
-
-
 class MessageOut(BaseModel):
     id: int
     user_id: int
@@ -48,3 +41,7 @@ class MessageOut(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class MuteRequest(BaseModel):
+    minutes: int
