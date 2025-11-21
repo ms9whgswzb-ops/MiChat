@@ -101,8 +101,10 @@ def create_admin_if_needed(db: Session):
 
     admin = db.query(User).filter(User.username == admin_username).first()
     if admin:
+        print(f"[ADMIN] Admin '{admin_username}' existiert bereits (id={admin.id})")
         return
 
+    print(f"[ADMIN] Erstelle Admin '{admin_username}'")
     admin = User(
         username=admin_username,
         password_hash=hash_password(admin_password),
@@ -112,7 +114,7 @@ def create_admin_if_needed(db: Session):
     db.add(admin)
     db.commit()
     db.refresh(admin)
-    print(f"Admin-User '{admin_username}' angelegt.")
+    print(f"[ADMIN] Admin-User '{admin_username}' angelegt, id={admin.id}")
 
 
 @app.on_event("startup")
@@ -133,6 +135,7 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket, user_id: int):
         await websocket.accept()
         self.active_connections.setdefault(user_id, []).append(websocket)
+        print(f"[WS] User {user_id} verbunden. Aktive Verbindungen: {len(self.active_connections)}")
 
     def disconnect(self, websocket: WebSocket, user_id: int):
         conns = self.active_connections.get(user_id)
@@ -142,6 +145,7 @@ class ConnectionManager:
             conns.remove(websocket)
         if not conns:
             del self.active_connections[user_id]
+        print(f"[WS] User {user_id} getrennt. Aktive Verbindungen: {len(self.active_connections)}")
 
     async def send_personal(self, user_id: int, message: dict):
         conns = self.active_connections.get(user_id, [])
@@ -174,47 +178,69 @@ async def index(request: Request):
 # ---------- Auth- & User-Routen ----------
 @app.post("/register", response_model=UserOut)
 def register(user_in: UserCreate, db: Session = Depends(get_db)):
-    existing = db.query(User).filter(User.username == user_in.username).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Benutzername ist bereits vergeben")
+    print(f"[REGISTER] Versuch: username={user_in.username!r}")
+    try:
+        existing = db.query(User).filter(User.username == user_in.username).first()
+        if existing:
+            print(f"[REGISTER] Benutzername bereits vergeben: {user_in.username!r}")
+            raise HTTPException(status_code=400, detail="Benutzername ist bereits vergeben")
 
-    if user_in.username.lower() == os.getenv("ADMIN_USERNAME", "admin").lower():
-        raise HTTPException(status_code=400, detail="Dieser Benutzername ist reserviert")
+        if user_in.username.lower() == os.getenv("ADMIN_USERNAME", "admin").lower():
+            print(f"[REGISTER] Versuch, reservierten Admin-Namen zu verwenden: {user_in.username!r}")
+            raise HTTPException(status_code=400, detail="Dieser Benutzername ist reserviert")
 
-    color = user_in.color or "#ffffff"
+        color = user_in.color or "#ffffff"
 
-    user = User(
-        username=user_in.username,
-        password_hash=hash_password(user_in.password),
-        color=color,
-        is_admin=False,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
+        user = User(
+            username=user_in.username,
+            password_hash=hash_password(user_in.password),
+            color=color,
+            is_admin=False,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        print(f"[REGISTER] Erfolgreich: id={user.id}, username={user.username!r}")
+        return user
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[REGISTER] Serverfehler: {e}")
+        raise HTTPException(status_code=500, detail="Serverfehler bei der Registrierung")
 
 
 @app.post("/login", response_model=Token)
 def login(login_in: LoginRequest, db: Session = Depends(get_db)):
+    print(f"[LOGIN] Versuch: username={login_in.username!r}")
     user = db.query(User).filter(User.username == login_in.username).first()
-    if not user or not verify_password(login_in.password, user.password_hash):
+    if not user:
+        print("[LOGIN] Kein User gefunden")
+        raise HTTPException(status_code=401, detail="Falscher Benutzername oder Passwort")
+
+    print(f"[LOGIN] User gefunden, id={user.id}, username={user.username!r}")
+    ok = verify_password(login_in.password, user.password_hash)
+    print(f"[LOGIN] Passwort ok? {ok}")
+
+    if not ok:
         raise HTTPException(status_code=401, detail="Falscher Benutzername oder Passwort")
 
     token_data = user_to_token_data(user)
     access_token = create_access_token(token_data)
+    print(f"[LOGIN] Login erfolgreich, Token erstellt für user_id={user.id}")
     return Token(access_token=access_token, token_type="bearer")
 
 
 @app.get("/me", response_model=UserOut)
 def me(token: str, db: Session = Depends(get_db)):
     user = get_current_user(token, db)
+    print(f"[ME] user_id={user.id}, username={user.username!r}")
     return user
 
 
 @app.get("/users", response_model=List[UserOut])
 def list_users(token: str, db: Session = Depends(get_db)):
     current_user = get_current_user(token, db)
+    print(f"[USERS] Aufruf durch user_id={current_user.id}")
     users = db.query(User).order_by(User.username.asc()).all()
     return users
 
@@ -260,6 +286,7 @@ def get_private_messages(
     db: Session = Depends(get_db),
 ):
     current_user = get_current_user(token, db)
+    print(f"[PRIVATE/HISTORY] user_id={current_user.id}, with_user_id={with_user_id}")
 
     query = (
         db.query(Message)
@@ -297,17 +324,19 @@ def get_private_messages(
 # ---------- WebSocket: Chat in Echtzeit ----------
 @app.websocket("/ws")
 async def websocket_chat(websocket: WebSocket, token: str = Query(...)):
-    # Token ohne "Bearer " erwarten
+    # Token ist der reine JWT ohne "Bearer "
     try:
         payload = decode_access_token(token)
         user_id = int(payload.get("sub"))
-    except Exception:
+    except Exception as e:
+        print(f"[WS] Ungültiger Token: {e}")
         await websocket.close(code=1008)
         return
 
     db = SessionLocal()
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
+        print(f"[WS] User {user_id} nicht gefunden")
         await websocket.close(code=1008)
         db.close()
         return
@@ -351,10 +380,6 @@ async def websocket_chat(websocket: WebSocket, token: str = Query(...)):
                 if not recipient:
                     continue
 
-                if recipient.id == user.id:
-                    # optional: sich selbst schreiben -> erlauben oder nicht
-                    pass
-
                 message = Message(
                     user_id=user.id,
                     recipient_id=recipient.id,
@@ -386,7 +411,8 @@ async def websocket_chat(websocket: WebSocket, token: str = Query(...)):
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, user_id)
-    except Exception:
+    except Exception as e:
+        print(f"[WS] Fehler: {e}")
         manager.disconnect(websocket, user_id)
     finally:
         db.close()
