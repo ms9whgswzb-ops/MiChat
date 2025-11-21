@@ -33,6 +33,20 @@ const chatSubtitle = document.getElementById("chat-subtitle");
 
 // ---------- Helper ----------
 
+function getCurrentChatTarget() {
+    const value = chatTargetSelect.value;
+    if (value === "global") {
+        return { mode: "global" };
+    } else {
+        const userId = parseInt(value, 10);
+        if (!isNaN(userId)) {
+            return { mode: "private", userId };
+        } else {
+            return { mode: "global" };
+        }
+    }
+}
+
 function setLoggedIn(user, token) {
     currentUser = user;
     accessToken = token;
@@ -68,20 +82,6 @@ function setLoggedOut() {
     // Reset Chat-Auswahl
     chatTargetSelect.innerHTML = `<option value="global">🌍 Globaler Chat</option>`;
     chatSubtitle.textContent = "Öffentlicher Raum";
-}
-
-function getCurrentChatTarget() {
-    const value = chatTargetSelect.value;
-    if (value === "global") {
-        return { mode: "global" };
-    } else {
-        const userId = parseInt(value, 10);
-        if (!isNaN(userId)) {
-            return { mode: "private", userId };
-        } else {
-            return { mode: "global" };
-        }
-    }
 }
 
 async function apiRequest(path, method = "GET", body = null, authenticated = false) {
@@ -140,7 +140,6 @@ function connectWebSocket() {
 
     socket.onclose = () => {
         console.log("WebSocket getrennt");
-        // optional: Reconnect-Logik einbauen
     };
 
     socket.onerror = (err) => {
@@ -182,8 +181,6 @@ function handleIncomingMessage(msg) {
         if (target.mode === "private" && target.userId === partnerId) {
             appendMessage(msg);
             scrollMessagesToBottom();
-        } else {
-            // Optional: später Badge/Notification im User-Dropdown machen
         }
     }
 }
@@ -342,7 +339,7 @@ async function loadMessagesForCurrentTarget() {
 
     const target = getCurrentChatTarget();
 
-    try:
+    try {
         let path;
         let authenticated = false;
 
