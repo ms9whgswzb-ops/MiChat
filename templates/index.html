@@ -8,6 +8,7 @@
 </head>
 <body>
     <div class="app-container">
+        <!-- Linke Seite: Auth + Admin -->
         <div class="auth-container">
             <h1>MiChat</h1>
 
@@ -34,8 +35,34 @@
                 <p>Eingeloggt als: <span id="current-username"></span></p>
                 <button id="logout-btn">Logout</button>
             </div>
+
+            <!-- ADMIN PANEL -->
+            <div id="admin-panel" class="card hidden">
+                <h2>Admin Panel</h2>
+                <p class="admin-hint">Nur für Admins sichtbar</p>
+                <button id="admin-refresh-users-btn">Benutzer neu laden</button>
+                <p class="error" id="admin-error"></p>
+
+                <div class="admin-users-table-wrapper">
+                    <table class="admin-users-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Benutzer</th>
+                                <th>Rolle</th>
+                                <th>Status</th>
+                                <th>Aktionen</th>
+                            </tr>
+                        </thead>
+                        <tbody id="admin-users-tbody">
+                            <!-- wird per JS gefüllt -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </div>
 
+        <!-- Rechte Seite: Chat -->
         <div class="chat-container">
             <div class="chat-top-bar">
                 <div class="chat-target-group">
