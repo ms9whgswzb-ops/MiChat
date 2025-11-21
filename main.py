@@ -41,10 +41,8 @@ from auth import (
     user_to_token_data,
 )
 
-
+# ---------- Setup ----------
 load_dotenv()
-
-# ---------- DB Setup ----------
 Base.metadata.create_all(bind=engine)
 
 
@@ -56,18 +54,16 @@ def get_db():
         db.close()
 
 
-# ---------- FastAPI Setup ----------
 app = FastAPI(title="MiChat")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # für Produktion einschränken
+    allow_origins=["*"],  # ggf. einschränken
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Static & Templates mit absolutem Pfad (wichtig für Render)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 static_dir = os.path.join(BASE_DIR, "static")
 templates_dir = os.path.join(BASE_DIR, "templates")
@@ -137,16 +133,16 @@ def on_startup():
         db.close()
 
 
-# ---------- WebSocket Connection Manager ----------
+# ---------- WebSocket Manager ----------
 class ConnectionManager:
     def __init__(self):
-        # user_id -> Liste von WebSockets
+        # user_id -> Liste von Verbindungen
         self.active_connections: Dict[int, List[WebSocket]] = {}
 
     async def connect(self, websocket: WebSocket, user_id: int):
         await websocket.accept()
         self.active_connections.setdefault(user_id, []).append(websocket)
-        print(f"[WS] User {user_id} verbunden. Aktive User: {list(self.active_connections.keys())}")
+        print(f"[WS] User {user_id} verbunden. Aktive: {list(self.active_connections.keys())}")
 
     def disconnect(self, websocket: WebSocket, user_id: int):
         conns = self.active_connections.get(user_id)
@@ -156,7 +152,7 @@ class ConnectionManager:
             conns.remove(websocket)
         if not conns:
             del self.active_connections[user_id]
-        print(f"[WS] User {user_id} getrennt. Aktive User: {list(self.active_connections.keys())}")
+        print(f"[WS] User {user_id} getrennt. Aktive: {list(self.active_connections.keys())}")
 
     async def send_personal(self, user_id: int, message: dict):
         conns = self.active_connections.get(user_id, [])
@@ -239,7 +235,7 @@ def list_users(token: str, db: Session = Depends(get_db)):
     return users
 
 
-# ---------- Admin: Users ----------
+# ---------- Admin-User-Actions ----------
 @app.get("/admin/users", response_model=List[UserOut])
 def admin_list_users(token: str, db: Session = Depends(get_db)):
     current = get_current_user(token, db)
@@ -354,12 +350,9 @@ def delete_user(
     return None
 
 
-# ---------- Nachrichten (HTTP) ----------
+# ---------- Nachrichten per HTTP ----------
 @app.get("/messages", response_model=List[MessageOut])
-def get_public_messages(
-    limit: int = 50,
-    db: Session = Depends(get_db),
-):
+def get_public_messages(limit: int = 50, db: Session = Depends(get_db)):
     query = (
         db.query(Message)
         .join(User, Message.user_id == User.id)
@@ -429,12 +422,14 @@ def get_private_messages(
     return result
 
 
-# ---------- WebSocket: Chat ----------
+# ---------- WebSocket Chat (mit Live-Ban/Mute) ----------
 @app.websocket("/ws")
 async def websocket_chat(websocket: WebSocket, token: str = Query(...)):
     db = SessionLocal()
+    user_id: Optional[int] = None
+
     try:
-        # Token hier ist der rohe JWT (ohne "Bearer ")
+        # Token auslesen
         try:
             payload = decode_access_token(token)
             user_id = int(payload.get("sub"))
@@ -443,6 +438,7 @@ async def websocket_chat(websocket: WebSocket, token: str = Query(...)):
             await websocket.close(code=1008)
             return
 
+        # initialer User-Check
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             print(f"[WS] User {user_id} nicht gefunden")
@@ -456,17 +452,31 @@ async def websocket_chat(websocket: WebSocket, token: str = Query(...)):
 
         await manager.connect(websocket, user.id)
 
+        # Nachrichten-Schleife
         while True:
             data = await websocket.receive_json()
+
+            # *** HIER: User bei jeder Nachricht neu laden,
+            # damit Ban/Mute sofort wirken ***
+            user = db.query(User).filter(User.id == user_id).first()
+            if not user:
+                print(f"[WS] User {user_id} während Session gelöscht")
+                await websocket.close(code=1008)
+                return
+
+            if user.is_banned:
+                print(f"[WS] User {user.username} wurde während Session gebannt")
+                await websocket.close(code=1008)
+                return
+
             msg_type = data.get("type")
             content = (data.get("content") or "").strip()
-
             if not content:
                 continue
 
-            # Mute-Prüfung
+            # Mute: solange muted_until in der Zukunft liegt, Nachricht ignorieren
             if user.muted_until and user.muted_until > datetime.utcnow():
-                # Einfach ignorieren (keine Nachricht schicken)
+                print(f"[WS] Nachricht von gemutetem User {user.username} verworfen")
                 continue
 
             if msg_type == "public_message":
@@ -479,7 +489,7 @@ async def websocket_chat(websocket: WebSocket, token: str = Query(...)):
                 db.commit()
                 db.refresh(message)
 
-                payload = {
+                payload_out = {
                     "id": message.id,
                     "user_id": user.id,
                     "username": user.username,
@@ -489,7 +499,7 @@ async def websocket_chat(websocket: WebSocket, token: str = Query(...)):
                     "content": message.content,
                     "created_at": message.created_at.isoformat(),
                 }
-                await manager.broadcast(payload)
+                await manager.broadcast(payload_out)
 
             elif msg_type == "private_message":
                 recipient_id = data.get("recipient_id")
@@ -509,7 +519,7 @@ async def websocket_chat(websocket: WebSocket, token: str = Query(...)):
                 db.commit()
                 db.refresh(message)
 
-                payload = {
+                payload_out = {
                     "id": message.id,
                     "user_id": user.id,
                     "username": user.username,
@@ -520,14 +530,16 @@ async def websocket_chat(websocket: WebSocket, token: str = Query(...)):
                     "created_at": message.created_at.isoformat(),
                 }
 
-                await manager.send_personal(user.id, payload)
+                await manager.send_personal(user.id, payload_out)
                 if recipient.id != user.id:
-                    await manager.send_personal(recipient.id, payload)
+                    await manager.send_personal(recipient.id, payload_out)
 
     except WebSocketDisconnect:
-        manager.disconnect(websocket, user_id)
+        if user_id is not None:
+            manager.disconnect(websocket, user_id)
     except Exception as e:
         print(f"[WS] Fehler: {e}")
-        manager.disconnect(websocket, user_id)
+        if user_id is not None:
+            manager.disconnect(websocket, user_id)
     finally:
         db.close()
