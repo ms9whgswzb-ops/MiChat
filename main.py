@@ -1,4 +1,6 @@
+# main.py
 import os
+from datetime import datetime, timedelta
 from typing import List, Optional, Dict
 
 from fastapi import (
@@ -9,6 +11,7 @@ from fastapi import (
     status,
     WebSocket,
     WebSocketDisconnect,
+    Query,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -28,6 +31,7 @@ from schemas import (
     Token,
     LoginRequest,
     MessageOut,
+    MuteRequest,
 )
 from auth import (
     hash_password,
@@ -38,8 +42,9 @@ from auth import (
 )
 
 
-# ---------- INITIAL SETUP ----------
 load_dotenv()
+
+# ---------- DB Setup ----------
 Base.metadata.create_all(bind=engine)
 
 
@@ -51,38 +56,36 @@ def get_db():
         db.close()
 
 
+# ---------- FastAPI Setup ----------
 app = FastAPI(title="MiChat")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # für Produktion einschränken
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ---------- STATIC & TEMPLATE PATHS (ABSOLUTE) ----------
+# Static & Templates mit absolutem Pfad (wichtig für Render)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 static_dir = os.path.join(BASE_DIR, "static")
 templates_dir = os.path.join(BASE_DIR, "templates")
 
 if not os.path.isdir(static_dir):
-    print(f"[WARN] Static directory not found: {static_dir}")
-
+    print(f"[WARN] Static-Verzeichnis fehlt: {static_dir}")
 if not os.path.isdir(templates_dir):
-    print(f"[WARN] Templates directory not found: {templates_dir}")
+    print(f"[WARN] Templates-Verzeichnis fehlt: {templates_dir}")
 
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 templates = Jinja2Templates(directory=templates_dir)
 
 
-# ---------- AUTH HELPERS ----------
+# ---------- Auth Helper ----------
 def get_current_user(token: Optional[str] = None, db: Session = Depends(get_db)) -> User:
     if not token:
-        raise HTTPException(status_code=401, detail="Token fehlt")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token fehlt")
 
-    # remove "Bearer "
     if token.lower().startswith("bearer "):
         token = token.split(" ", 1)[1]
 
@@ -90,16 +93,19 @@ def get_current_user(token: Optional[str] = None, db: Session = Depends(get_db))
         payload = decode_access_token(token)
         user_id = int(payload.get("sub"))
     except Exception:
-        raise HTTPException(401, "Ungültiger oder abgelaufener Token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Ungültiger oder abgelaufener Token",
+        )
 
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise HTTPException(401, "Benutzer nicht gefunden")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Benutzer nicht gefunden")
 
     return user
 
 
-# ---------- ADMIN CREATION ----------
+# ---------- Admin anlegen ----------
 def create_admin_if_needed(db: Session):
     admin_username = os.getenv("ADMIN_USERNAME", "admin")
     admin_password = os.getenv("ADMIN_PASSWORD", "admin")
@@ -107,87 +113,94 @@ def create_admin_if_needed(db: Session):
 
     admin = db.query(User).filter(User.username == admin_username).first()
     if admin:
-        print(f"[ADMIN] Exists (id={admin.id})")
+        print(f"[ADMIN] Admin '{admin_username}' existiert (id={admin.id})")
         return
 
-    print(f"[ADMIN] Creating admin user '{admin_username}'")
-    u = User(
+    admin = User(
         username=admin_username,
         password_hash=hash_password(admin_password),
         color=admin_color,
         is_admin=True,
     )
-    db.add(u)
+    db.add(admin)
     db.commit()
-    db.refresh(u)
-    print(f"[ADMIN] Admin created (id={u.id})")
+    db.refresh(admin)
+    print(f"[ADMIN] Admin-User '{admin_username}' angelegt, id={admin.id}")
 
 
 @app.on_event("startup")
-def startup_event():
+def on_startup():
     db = SessionLocal()
-    create_admin_if_needed(db)
-    db.close()
+    try:
+        create_admin_if_needed(db)
+    finally:
+        db.close()
 
 
-# ---------- WEBSOCKET MANAGER ----------
+# ---------- WebSocket Connection Manager ----------
 class ConnectionManager:
     def __init__(self):
-        self.active: Dict[int, List[WebSocket]] = {}
+        # user_id -> Liste von WebSockets
+        self.active_connections: Dict[int, List[WebSocket]] = {}
 
-    async def connect(self, ws: WebSocket, user_id: int):
-        await ws.accept()
-        self.active.setdefault(user_id, []).append(ws)
+    async def connect(self, websocket: WebSocket, user_id: int):
+        await websocket.accept()
+        self.active_connections.setdefault(user_id, []).append(websocket)
+        print(f"[WS] User {user_id} verbunden. Aktive User: {list(self.active_connections.keys())}")
 
-    def disconnect(self, ws: WebSocket, user_id: int):
-        conns = self.active.get(user_id)
+    def disconnect(self, websocket: WebSocket, user_id: int):
+        conns = self.active_connections.get(user_id)
         if not conns:
             return
-        if ws in conns:
-            conns.remove(ws)
+        if websocket in conns:
+            conns.remove(websocket)
         if not conns:
-            del self.active[user_id]
+            del self.active_connections[user_id]
+        print(f"[WS] User {user_id} getrennt. Aktive User: {list(self.active_connections.keys())}")
 
-    async def send_user(self, user_id: int, data: dict):
-        if user_id not in self.active:
-            return
-        dead = []
-        for ws in self.active[user_id]:
+    async def send_personal(self, user_id: int, message: dict):
+        conns = self.active_connections.get(user_id, [])
+        to_remove = []
+        for ws in conns:
             try:
-                await ws.send_json(data)
-            except:
-                dead.append(ws)
-        for ws in dead:
+                await ws.send_json(message)
+            except WebSocketDisconnect:
+                to_remove.append(ws)
+            except Exception:
+                to_remove.append(ws)
+        for ws in to_remove:
             self.disconnect(ws, user_id)
 
-    async def broadcast(self, data: dict):
-        for uid in list(self.active.keys()):
-            await self.send_user(uid, data)
+    async def broadcast(self, message: dict):
+        for uid in list(self.active_connections.keys()):
+            await self.send_personal(uid, message)
 
 
 manager = ConnectionManager()
 
 
-# ---------- HTML PAGE ----------
+# ---------- HTML ----------
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request):
+async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 
-# ---------- USER CRUD ----------
+# ---------- Auth & User ----------
 @app.post("/register", response_model=UserOut)
 def register(user_in: UserCreate, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.username == user_in.username).first()
     if existing:
-        raise HTTPException(400, "Benutzername ist bereits vergeben")
+        raise HTTPException(status_code=400, detail="Benutzername ist bereits vergeben")
 
     if user_in.username.lower() == os.getenv("ADMIN_USERNAME", "admin").lower():
-        raise HTTPException(400, "Benutzername ist reserviert")
+        raise HTTPException(status_code=400, detail="Dieser Benutzername ist reserviert")
+
+    color = user_in.color or "#ffffff"
 
     user = User(
         username=user_in.username,
         password_hash=hash_password(user_in.password),
-        color=user_in.color,
+        color=color,
         is_admin=False,
     )
     db.add(user)
@@ -200,182 +213,321 @@ def register(user_in: UserCreate, db: Session = Depends(get_db)):
 def login(login_in: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == login_in.username).first()
     if not user:
-        raise HTTPException(401, "Falscher Benutzername oder Passwort")
+        raise HTTPException(status_code=401, detail="Falscher Benutzername oder Passwort")
 
     if not verify_password(login_in.password, user.password_hash):
-        raise HTTPException(401, "Falscher Benutzername oder Passwort")
+        raise HTTPException(status_code=401, detail="Falscher Benutzername oder Passwort")
 
-    access_token = create_access_token(user_to_token_data(user))
+    if user.is_banned:
+        raise HTTPException(status_code=403, detail="Dieser Account ist gebannt.")
+
+    token_data = user_to_token_data(user)
+    access_token = create_access_token(token_data)
     return Token(access_token=access_token, token_type="bearer")
 
 
 @app.get("/me", response_model=UserOut)
 def me(token: str, db: Session = Depends(get_db)):
-    return get_current_user(token, db)
+    user = get_current_user(token, db)
+    return user
 
 
 @app.get("/users", response_model=List[UserOut])
 def list_users(token: str, db: Session = Depends(get_db)):
-    current = get_current_user(token, db)
+    current_user = get_current_user(token, db)
     users = db.query(User).order_by(User.username.asc()).all()
     return users
 
 
-# ---------- ADMIN DELETE USER ----------
-@app.delete("/users/{user_id}", status_code=204)
-def delete_user(user_id: int, token: str, db: Session = Depends(get_db)):
+# ---------- Admin: Users ----------
+@app.get("/admin/users", response_model=List[UserOut])
+def admin_list_users(token: str, db: Session = Depends(get_db)):
     current = get_current_user(token, db)
-
     if not current.is_admin:
-        raise HTTPException(403, "Nur Admins dürfen löschen")
+        raise HTTPException(status_code=403, detail="Nur Admins dürfen das")
+    users = db.query(User).order_by(User.username.asc()).all()
+    return users
 
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(404, "Benutzer nicht gefunden")
 
-    if user.id == current.id:
-        raise HTTPException(400, "Du kannst dich nicht selbst löschen")
+@app.post("/admin/users/{user_id}/mute", status_code=204)
+def admin_mute_user(
+    user_id: int,
+    mute: MuteRequest,
+    token: str,
+    db: Session = Depends(get_db),
+):
+    current = get_current_user(token, db)
+    if not current.is_admin:
+        raise HTTPException(status_code=403, detail="Nur Admins dürfen muten")
 
-    db.delete(user)
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
+
+    if mute.minutes <= 0:
+        raise HTTPException(status_code=400, detail="Minuten müssen > 0 sein")
+
+    target.muted_until = datetime.utcnow() + timedelta(minutes=mute.minutes)
     db.commit()
     return None
 
 
-# ---------- MESSAGES ----------
+@app.post("/admin/users/{user_id}/unmute", status_code=204)
+def admin_unmute_user(
+    user_id: int,
+    token: str,
+    db: Session = Depends(get_db),
+):
+    current = get_current_user(token, db)
+    if not current.is_admin:
+        raise HTTPException(status_code=403, detail="Nur Admins dürfen entmuten")
+
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
+
+    target.muted_until = None
+    db.commit()
+    return None
+
+
+@app.post("/admin/users/{user_id}/ban", status_code=204)
+def admin_ban_user(
+    user_id: int,
+    token: str,
+    db: Session = Depends(get_db),
+):
+    current = get_current_user(token, db)
+    if not current.is_admin:
+        raise HTTPException(status_code=403, detail="Nur Admins dürfen bannen")
+
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
+
+    if target.id == current.id:
+        raise HTTPException(status_code=400, detail="Du kannst dich nicht selbst bannen")
+
+    target.is_banned = True
+    db.commit()
+    return None
+
+
+@app.post("/admin/users/{user_id}/unban", status_code=204)
+def admin_unban_user(
+    user_id: int,
+    token: str,
+    db: Session = Depends(get_db),
+):
+    current = get_current_user(token, db)
+    if not current.is_admin:
+        raise HTTPException(status_code=403, detail="Nur Admins dürfen entbannen")
+
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
+
+    target.is_banned = False
+    db.commit()
+    return None
+
+
+@app.delete("/users/{user_id}", status_code=204)
+def delete_user(
+    user_id: int,
+    token: str,
+    db: Session = Depends(get_db),
+):
+    current = get_current_user(token, db)
+    if not current.is_admin:
+        raise HTTPException(status_code=403, detail="Nur Admins dürfen löschen")
+
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
+
+    if target.id == current.id:
+        raise HTTPException(status_code=400, detail="Du kannst dich nicht selbst löschen")
+
+    db.delete(target)
+    db.commit()
+    return None
+
+
+# ---------- Nachrichten (HTTP) ----------
 @app.get("/messages", response_model=List[MessageOut])
-def public_messages(limit: int = 50, db: Session = Depends(get_db)):
-    msgs = (
+def get_public_messages(
+    limit: int = 50,
+    db: Session = Depends(get_db),
+):
+    query = (
         db.query(Message)
-        .join(User)
+        .join(User, Message.user_id == User.id)
         .filter(Message.recipient_id.is_(None))
         .order_by(Message.id.desc())
-        .limit(limit)
-        .all()
     )
-    msgs = list(reversed(msgs))
 
-    return [
-        MessageOut(
-            id=m.id,
-            user_id=m.user_id,
-            username=m.user.username,
-            color=m.user.color,
-            is_admin=m.user.is_admin,
-            recipient_id=m.recipient_id,
-            content=m.content,
-            created_at=m.created_at,
+    messages = query.limit(limit).all()
+    messages = list(reversed(messages))
+
+    result: List[MessageOut] = []
+    for m in messages:
+        result.append(
+            MessageOut(
+                id=m.id,
+                user_id=m.user_id,
+                username=m.user.username,
+                color=m.user.color,
+                is_admin=m.user.is_admin,
+                recipient_id=m.recipient_id,
+                content=m.content,
+                created_at=m.created_at,
+            )
         )
-        for m in msgs
-    ]
+    return result
 
 
 @app.get("/private/messages", response_model=List[MessageOut])
-def private_messages(
+def get_private_messages(
     with_user_id: int,
     token: str,
     limit: int = 100,
     db: Session = Depends(get_db),
 ):
-    me = get_current_user(token, db)
+    current_user = get_current_user(token, db)
 
-    msgs = (
+    query = (
         db.query(Message)
-        .join(User)
+        .join(User, Message.user_id == User.id)
         .filter(
+            Message.recipient_id.isnot(None),
             or_(
-                and_(Message.user_id == me.id, Message.recipient_id == with_user_id),
-                and_(Message.user_id == with_user_id, Message.recipient_id == me.id),
-            )
+                and_(Message.user_id == current_user.id, Message.recipient_id == with_user_id),
+                and_(Message.user_id == with_user_id, Message.recipient_id == current_user.id),
+            ),
         )
         .order_by(Message.id.desc())
-        .limit(limit)
-        .all()
     )
-    msgs = list(reversed(msgs))
 
-    return [
-        MessageOut(
-            id=m.id,
-            user_id=m.user_id,
-            username=m.user.username,
-            color=m.user.color,
-            is_admin=m.user.is_admin,
-            recipient_id=m.recipient_id,
-            content=m.content,
-            created_at=m.created_at,
+    messages = query.limit(limit).all()
+    messages = list(reversed(messages))
+
+    result: List[MessageOut] = []
+    for m in messages:
+        result.append(
+            MessageOut(
+                id=m.id,
+                user_id=m.user_id,
+                username=m.user.username,
+                color=m.user.color,
+                is_admin=m.user.is_admin,
+                recipient_id=m.recipient_id,
+                content=m.content,
+                created_at=m.created_at,
+            )
         )
-        for m in msgs
-    ]
+    return result
 
 
-# ---------- WEBSOCKET ----------
+# ---------- WebSocket: Chat ----------
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket, token: str):
+async def websocket_chat(websocket: WebSocket, token: str = Query(...)):
     db = SessionLocal()
     try:
-        user = get_current_user(token, db)
-        await manager.connect(ws, user.id)
+        # Token hier ist der rohe JWT (ohne "Bearer ")
+        try:
+            payload = decode_access_token(token)
+            user_id = int(payload.get("sub"))
+        except Exception as e:
+            print(f"[WS] Ungültiger Token: {e}")
+            await websocket.close(code=1008)
+            return
+
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            print(f"[WS] User {user_id} nicht gefunden")
+            await websocket.close(code=1008)
+            return
+
+        if user.is_banned:
+            print(f"[WS] Gebannter User {user.username} wollte verbinden")
+            await websocket.close(code=1008)
+            return
+
+        await manager.connect(websocket, user.id)
 
         while True:
-            data = await ws.receive_json()
-
+            data = await websocket.receive_json()
             msg_type = data.get("type")
-            content = data.get("content")
+            content = (data.get("content") or "").strip()
 
             if not content:
                 continue
 
-            if msg_type == "public_message":
-                msg = Message(
-                    user_id=user.id,
-                    content=content,
-                    recipient_id=None,
-                )
-                db.add(msg)
-                db.commit()
-                db.refresh(msg)
+            # Mute-Prüfung
+            if user.muted_until and user.muted_until > datetime.utcnow():
+                # Einfach ignorieren (keine Nachricht schicken)
+                continue
 
-                out = {
-                    "id": msg.id,
+            if msg_type == "public_message":
+                message = Message(
+                    user_id=user.id,
+                    recipient_id=None,
+                    content=content,
+                )
+                db.add(message)
+                db.commit()
+                db.refresh(message)
+
+                payload = {
+                    "id": message.id,
                     "user_id": user.id,
                     "username": user.username,
                     "color": user.color,
                     "is_admin": user.is_admin,
                     "recipient_id": None,
-                    "content": msg.content,
-                    "created_at": msg.created_at.isoformat(),
+                    "content": message.content,
+                    "created_at": message.created_at.isoformat(),
                 }
-                await manager.broadcast(out)
+                await manager.broadcast(payload)
 
             elif msg_type == "private_message":
-                rid = data.get("recipient_id")
-                if not rid:
+                recipient_id = data.get("recipient_id")
+                if not isinstance(recipient_id, int):
                     continue
 
-                msg = Message(
-                    user_id=user.id,
-                    content=content,
-                    recipient_id=rid,
-                )
-                db.add(msg)
-                db.commit()
-                db.refresh(msg)
+                recipient = db.query(User).filter(User.id == recipient_id).first()
+                if not recipient:
+                    continue
 
-                out = {
-                    "id": msg.id,
+                message = Message(
+                    user_id=user.id,
+                    recipient_id=recipient.id,
+                    content=content,
+                )
+                db.add(message)
+                db.commit()
+                db.refresh(message)
+
+                payload = {
+                    "id": message.id,
                     "user_id": user.id,
                     "username": user.username,
                     "color": user.color,
                     "is_admin": user.is_admin,
-                    "recipient_id": rid,
-                    "content": msg.content,
-                    "created_at": msg.created_at.isoformat(),
+                    "recipient_id": recipient.id,
+                    "content": message.content,
+                    "created_at": message.created_at.isoformat(),
                 }
 
-                await manager.send_user(rid, out)
-                await manager.send_user(user.id, out)
+                await manager.send_personal(user.id, payload)
+                if recipient.id != user.id:
+                    await manager.send_personal(recipient.id, payload)
 
     except WebSocketDisconnect:
-        manager.disconnect(ws, user.id)
+        manager.disconnect(websocket, user_id)
+    except Exception as e:
+        print(f"[WS] Fehler: {e}")
+        manager.disconnect(websocket, user_id)
     finally:
         db.close()
